@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
+import copy
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  ## use GPU if available
 
 #%%
@@ -47,6 +48,8 @@ class SGHMC(nn.Module):
         (loss_train[0], accu_train[0]) = self.model.evaluate(self.train_loader)
         (loss_test[0], accu_test[0]) = self.model.evaluate(self.test_loader)        
         
+        kin_energy = np.zeros((self.epochs+1,3));  L2weight = np.zeros((self.epochs+1,3))   # DEBUG
+        
         datasize = len(self.train_loader.dataset)
         
         start_time = time.time()
@@ -54,10 +57,16 @@ class SGHMC(nn.Module):
         
         for p in self.model.parameters():
             p.buf = torch.randn(p.size()).to(device)*np.sqrt(self.lr)
+            
+        for (idx,p) in enumerate(self.model.parameters()):
+            kin_energy[0,idx//2] += (p.buf**2).sum() ; L2weight[0,idx//2] = (p.data**2).sum()    # DEBUG
         
     
         for epoch in range(1, self.epochs+1):
+            print("enter epich ", epoch)
             self.model.train()
+            # if epoch==20: 
+            #     self.lr = self.lr/200 ; print("At epoch 20: reduced lr by 200")    # DEBUG
             
             for batch_idx, (data, target) in enumerate(self.train_loader):
                 data, target = data.to(device), target.to(device)
@@ -71,6 +80,8 @@ class SGHMC(nn.Module):
             (loss_train[epoch], accu_train[epoch]) = self.model.evaluate(self.train_loader)
             (loss_test[epoch], accu_test[epoch]) = self.model.evaluate(self.test_loader)
             
+            for (idx,p) in enumerate(self.model.parameters()):
+                kin_energy[epoch,idx//2] += (p.buf**2).sum() ; L2weight[epoch,idx//2] = (p.data**2).sum()    # DEBUG
             
             if epoch%5==0:
                 print("SGHMC EPOCH {} DONE!".format(epoch))
@@ -79,7 +90,7 @@ class SGHMC(nn.Module):
         print("Training took {} seconds, i.e {} minutes, with {} seconds per epoch!"
               .format(end_time-start_time, (end_time-start_time)/60, (end_time-start_time)/self.epochs))
             
-        return (loss_train, loss_test, accu_train, accu_test)
+        return (loss_train, loss_test, accu_train, accu_test, kin_energy, L2weight)     # DEBUG
 
 
     def update_params(self):
@@ -169,7 +180,8 @@ class OBABO(nn.Module):
         return (loss_train, loss_test, accu_train, accu_test)
     
     
-    def update_params_OBA(self):
+    def update_params_OBA(self):        ## ERROR!!!! gradients are still full from last BO method!!!
+        # print("CARE!! FIX GRADIENTS!!")
        
         for p in self.model.parameters():
         
@@ -201,7 +213,156 @@ class OBABO(nn.Module):
 
 
 
+class HMC(nn.Module):
+    
+    def __init__(self, model, train_loader, test_loader, criterion, lr, weight_decay, gamma, epochs, L):
+        super(HMC, self).__init__()
+        self.model = model
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+        self.criterion = criterion
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.gamma = gamma
+        self.epochs = epochs
+        self.L = L
+        
+        
+    def train(self):
+        
+        datasize = len(self.train_loader.dataset)
+        
+        N = self.epochs / (self.L * self.train_loader.batch_size / datasize + 1)    # number of outer loop iterations,
+        N = np.rint( N + 0.5 )                                                      # i.e. samples to take, for the desired
+                                                                                    # number of epochs.
+        loss_train = np.zeros(N+1)                
+        accu_train = np.zeros(N+1)                 
+        loss_test = np.zeros(N+1)
+        accu_test = np.zeros(N+1)
+        
+        (loss_train[0], accu_train[0]) = self.model.evaluate(self.train_loader)
+        (loss_test[0], accu_test[0]) = self.model.evaluate(self.test_loader)        
+        
+        
+        for p in self.model.parameters():                       # create momentum buffers
+            p.buf = torch.zeros(p.size()).to(device)
 
+
+        (data, target) = next(iter(self.train_loader))          # compute initial gradients 
+        data, target = data.to(device), target.to(device)
+        self.model.zero_grad()
+        # output = self.model(data).squeeze()
+        output = self.model(data)
+        loss = self.criterion(output, target)*datasize
+        loss.backward()
+        for p in list(self.model.parameters()):
+            p.grad.data.add_(p.data, alpha=self.weight_decay)
+        
+
+        param_list_curr = copy.deepcopy(list(self.model.parameters()))  # buffer for the params before the BAB steps
+        
+        U0 = get_energy(self.model, self.train_loader, self.criterion, self.weight_decay)  # get pot. energy
+        
+        
+        
+        start_time = time.time()
+        print("Starting HMC sampling...")     
+        
+        for n in range(1,N+1):
+            
+            
+            K0 = 0
+            for p in list(self.model.parameters()):                 # resample momentum and 
+                p.buf = torch.randn(p.size()).to(device)            # store initial kin. energy
+                K0 += (p.buf**2).sum()
+            K0 *= 0.5
+                
+            ## L leapfrog steps     
+            for batch_idx, (data, target) in enumerate(self.train_loader):
+                if batch_idx == self.L: break
+                
+                for p in list(self.model.parameters()):
+                    p.buf.add_(p.grad.data, alpha=-0.5*self.lr)                     # B-step
+                    p.data.add_(p.buf, alpha=self.lr)                               # A-step
+                    
+                data, target = data.to(device), target.to(device)               # compute new gradients
+                self.model.zero_grad()
+                # output = self.model(data).squeeze()
+                output = self.model(data)
+                loss = self.criterion(output, target)*datasize
+                loss.backward()
+                
+                for p in list(self.model.parameters()):
+                    p.grad.data.add_(p.data, alpha=self.weight_decay)                    
+                    p.buf.add_(p.grad.data, alpha=-0.5*self.lr)                     # B-step
+            
+            
+            ## Metropolis
+            U1 = get_energy(self.model, self.train_loader, self.criterion, self.weight_decay)  # get pot. energy
+            K1 = 0
+            for p in list(self.model.parameters()):
+                K1 += (p.buf**2).sum() 
+            K1 = 0.5*K1.item()
+            
+            MH = torch.exp( -1 * (U1 - U0 + K1-K0) )
+            
+            if( torch.rand(1) < min(1., MH) ):          # accept sample
+               
+                (loss_train[n], accu_train[n]) = self.model.evaluate(self.train_loader)
+                (loss_test[n], accu_test[n]) = self.model.evaluate(self.test_loader)
+                
+                param_list_curr = copy.deepcopy(list(self.model.parameters()))
+                U0 = U1
+                
+            else:
+                (loss_train[n], accu_train[n]) = (loss_train[n-1], accu_train[n-1])
+                (loss_test[n], accu_test[n]) = (loss_test[n-1], accu_test[n-1])
+                
+                with torch.no_grad():
+                    for (idx,p) in enumerate(list(self.model.parameters())):
+                        p.copy_(param_list_curr[idx])
+                
+
+            
+            if N%5==0:
+                print("HMC ITERATION {} DONE!".format(n))
+        
+        end_time = time.time()
+        print("Training took {} seconds, i.e {} minutes, with {} seconds per epoch!"
+              .format(end_time-start_time, (end_time-start_time)/60, (end_time-start_time)/self.epochs))
+            
+        return (loss_train, loss_test, accu_train, accu_test)
+        
+        
+        
+        
+def get_energy(model, dataloader, criterion, weight_decay):
+    """
+    Computes potential energy for given model, data set, criterion, and weight decay.
+    """
+    # first the likelihood part...
+    loss = 0
+    criterion.reduction = "sum"
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(dataloader):
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss += criterion(output, target)
+    U = loss.item()
+    criterion.reduction = "mean"
+    
+    # ... then the prior / L2 part
+    L2 = 0
+    for p in list(model.parameters()):
+        L2 += (p.data**2).sum()
+    
+    U += 0.5 * weight_decay * L2.item()
+    
+    return U
+
+
+
+        
 def train_optimizer(model, optimizer, train_loader, test_loader, criterion, epochs):
     
     loss_train = np.zeros(epochs+1)                 
