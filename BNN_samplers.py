@@ -52,6 +52,10 @@ class SGHMC(nn.Module):
         
         datasize = len(self.train_loader.dataset)
         
+        squeeze = True if type(self.criterion) == torch.nn.modules.loss.BCELoss else False   # squeeze network output
+                                                                                             # for BCELoss (not required
+                                                                                             # for NLLLoss)
+        
         start_time = time.time()
         print("Starting SGHMC sampling...")
         
@@ -71,8 +75,8 @@ class SGHMC(nn.Module):
             for batch_idx, (data, target) in enumerate(self.train_loader):
                 data, target = data.to(device), target.to(device)
                 self.model.zero_grad()
-                # output = self.model(data).squeeze()
-                output = self.model(data)
+                output = self.model(data) 
+                if squeeze: output=output.squeeze()
                 loss = self.criterion(output, target)*datasize
                 loss.backward()
                 self.update_params()
@@ -137,14 +141,18 @@ class OBABO(nn.Module):
         
         datasize = len(self.train_loader.dataset)
         
+        squeeze = True if type(self.criterion) == torch.nn.modules.loss.BCELoss else False   # squeeze network output
+                                                                                             # for BCELoss (not required
+                                                                                             # for NLLLoss)
+        
         start_time = time.time()
         print("Starting OBABO sampling...")     
         
         (data, target) = next(iter(self.train_loader))          # compute initial gradients
         data, target = data.to(device), target.to(device)
         self.model.zero_grad()
-        # output = self.model(data).squeeze()
         output = self.model(data)
+        if squeeze: output=output.squeeze()
         loss = self.criterion(output, target)*datasize
         loss.backward()
         
@@ -160,7 +168,8 @@ class OBABO(nn.Module):
                 
                 data, target = data.to(device), target.to(device)   # compute new gradients
                 self.model.zero_grad()
-                # output = self.model(data).squeeze()
+                output = self.model(data)
+                if squeeze: output=output.squeeze()
                 output = self.model(data)
                 loss = self.criterion(output, target)*datasize
                 loss.backward()
@@ -243,6 +252,9 @@ class HMC(nn.Module):
         (loss_train[0], accu_train[0]) = self.model.evaluate(self.train_loader)
         (loss_test[0], accu_test[0]) = self.model.evaluate(self.test_loader)        
         
+        squeeze = True if type(self.criterion) == torch.nn.modules.loss.BCELoss else False   # squeeze network output
+                                                                                             # for BCELoss (not required
+                                                                                             # for NLLLoss)
         
         for p in self.model.parameters():                       # create momentum buffers
             p.buf = torch.zeros(p.size()).to(device)
@@ -251,8 +263,8 @@ class HMC(nn.Module):
         (data, target) = next(iter(self.train_loader))          # compute initial gradients 
         data, target = data.to(device), target.to(device)
         self.model.zero_grad()
-        # output = self.model(data).squeeze()
         output = self.model(data)
+        if squeeze: output=output.squeeze()
         loss = self.criterion(output, target)*datasize
         loss.backward()
         for p in list(self.model.parameters()):
@@ -287,8 +299,8 @@ class HMC(nn.Module):
                     
                 data, target = data.to(device), target.to(device)               # compute new gradients
                 self.model.zero_grad()
-                # output = self.model(data).squeeze()
                 output = self.model(data)
+                if squeeze: output=output.squeeze()
                 loss = self.criterion(output, target)*datasize
                 loss.backward()
                 
